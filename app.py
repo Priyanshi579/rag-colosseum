@@ -31,19 +31,27 @@ class RagEngine:
         self.passages = json.loads((BASE / "knowledge_base.json").read_text(encoding="utf-8"))
         if not isinstance(self.passages, list) or len(self.passages) != 50 or not all(isinstance(x, str) for x in self.passages):
             raise RuntimeError("knowledge_base.json must contain exactly 50 passage strings")
-        from sentence_transformers import SentenceTransformer
+        # FastEmbed uses quantized ONNX inference and avoids importing PyTorch
+        # (and its large CUDA dependencies) on small free instances.
+        from fastembed import TextEmbedding
 
-        self.model = SentenceTransformer(MODEL_NAME, device="cpu")
-        self.embeddings = self.model.encode(self.passages, normalize_embeddings=True, convert_to_numpy=True)
+        self.model = TextEmbedding(model_name=MODEL_NAME, threads=1)
+        self.embeddings = self._encode(self.passages)
         self.lock = threading.Lock()
         log.info("Loaded %s passages and embedding model %s", len(self.passages), MODEL_NAME)
 
     def retrieve(self, question: str, k: int) -> tuple[list[int], list[float]]:
-        query_vec = self.model.encode([question], normalize_embeddings=True, convert_to_numpy=True)[0]
+        query_vec = self._encode([question])[0]
         sims = np.asarray(self.embeddings @ query_vec, dtype=np.float32)
         # Stable ordering makes tied scores deterministic.
         ranked = sorted(range(len(sims)), key=lambda i: (-float(sims[i]), i))[:k]
         return ranked, [float(np.clip(sims[i], 0.0, 1.0)) for i in ranked]
+
+    def _encode(self, texts: list[str]) -> np.ndarray:
+        vectors = np.asarray(list(self.model.embed(texts)), dtype=np.float32)
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        np.divide(vectors, np.maximum(norms, 1e-12), out=vectors)
+        return vectors
 
     def respond(self, question: str, k: int) -> dict[str, Any]:
         q = question.strip()
